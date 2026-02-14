@@ -1,0 +1,18 @@
+# packages.txt - UPDATED FOR STREAMLIT CLOUD
+# System dependencies for medical document processing and RAG
+
+# OCR and Document Processing
+tesseract-ocr
+tesseract-ocr-eng
+poppler-utils
+libgl1-mesa-glx
+libglib2.0-0
+
+# Additional image processing libraries
+libsm6
+libxext6
+libxrender-dev
+libgomp1
+
+# For FAISS vector database (CPU version)
+libomp-dev
