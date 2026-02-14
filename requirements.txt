@@ -22,7 +22,7 @@ reportlab
 
 # RAG - Simplified (only if needed)
 # Comment out if causing issues, app works without RAG
-# langchain
+langchain
 # langchain-community
 # langchain-text-splitters
 # sentence-transformers
