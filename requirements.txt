@@ -4,6 +4,11 @@ numpy
 Pillow
 pytesseract
 pdf2image
-opencv-python-headless
+anthropic
 plotly
-
+reportlab
+python-dotenv
+langchain
+langchain-community
+faiss-cpu
+sentence-transformers
