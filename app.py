@@ -1,4 +1,4 @@
-# app.py - COMPLETE VERSION WITH RAG + ALL FEATURES
+# app.py - COMPLETE VERSION WITH OPTIONAL RAG
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -14,14 +14,32 @@ from typing import Dict, List, Tuple, Optional
 import hashlib
 import base64
 from io import BytesIO
-import anthropic
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter, A4
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage, PageBreak
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
 
-# RAG Imports with error handling
+# Optional imports with graceful fallback
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+    anthropic = None
+
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter, A4
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
+
+# Optional RAG imports
+RAG_AVAILABLE = False
+HuggingFaceEmbeddings = None
+FAISS = None
+RecursiveCharacterTextSplitter = None
+Document = None
+
 try:
     from langchain_community.embeddings import HuggingFaceEmbeddings
     from langchain_community.vectorstores import FAISS
@@ -36,15 +54,11 @@ except ImportError:
         from langchain.schema import Document
         RAG_AVAILABLE = True
     except ImportError:
-        RAG_AVAILABLE = False
-        HuggingFaceEmbeddings = None
-        FAISS = None
-        RecursiveCharacterTextSplitter = None
-        Document = None
+        pass
 
 # Configure page
 st.set_page_config(
-    page_title="MedLab AI Analyzer - RAG-Enhanced Multi-Report Analysis",
+    page_title="MedLab AI Analyzer - Multi-Report Analysis",
     page_icon="🧬",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -53,8 +67,6 @@ st.set_page_config(
 # Initialize session state
 if 'parsed_reports' not in st.session_state:
     st.session_state.parsed_reports = {}
-if 'correction_mode' not in st.session_state:
-    st.session_state.correction_mode = False
 if 'claude_client' not in st.session_state:
     st.session_state.claude_client = None
 if 'rag_system' not in st.session_state:
@@ -78,14 +90,6 @@ st.markdown("""
         margin-bottom: 2rem;
         font-size: 1.1rem;
     }
-    .report-card {
-        background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
-        border-radius: 15px;
-        padding: 20px;
-        margin: 10px 0;
-        border-left: 5px solid #0ea5e9;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-    }
     .date-header {
         background: linear-gradient(90deg, #1e40af, #3b82f6);
         color: white;
@@ -94,9 +98,6 @@ st.markdown("""
         font-weight: bold;
         margin: 15px 0;
     }
-    .trend-improving { color: #059669; font-weight: bold; }
-    .trend-worsening { color: #dc2626; font-weight: bold; }
-    .trend-stable { color: #6b7280; }
     .parameter-box {
         background-color: #f8fafc;
         border-radius: 12px;
@@ -122,14 +123,6 @@ st.markdown("""
         border-radius: 12px;
         margin: 15px 0;
     }
-    .stButton>button {
-        background: linear-gradient(90deg, #1e40af, #3b82f6);
-        color: white;
-        border-radius: 8px;
-        padding: 0.75rem 1.5rem;
-        font-weight: 600;
-        border: none;
-    }
     .status-badge {
         position: fixed;
         bottom: 20px;
@@ -142,11 +135,32 @@ st.markdown("""
     }
     .rag-active { background: #22c55e; }
     .rag-inactive { background: #6b7280; }
+    .feature-off { background: #dc2626; }
 </style>
 """, unsafe_allow_html=True)
 
 # Import reference data
-from medical_reference import REFERENCE_RANGES, CRITICAL_VALUES
+try:
+    from medical_reference import REFERENCE_RANGES, CRITICAL_VALUES
+except ImportError:
+    # Fallback if medical_reference.py not available
+    REFERENCE_RANGES = {
+        'Hemoglobin': {'male': (13.5, 17.5), 'female': (12.0, 16.0), 'unit': 'g/dL'},
+        'WBC': {'range': (4.5, 11.0), 'unit': 'x10^9/L'},
+        'Platelets': {'range': (150, 450), 'unit': 'x10^9/L'},
+        'Glucose_Fasting': {'range': (70, 100), 'unit': 'mg/dL'},
+        'HbA1c': {'range': (4.0, 5.6), 'unit': '%'},
+        'Creatinine': {'male': (0.7, 1.3), 'female': (0.6, 1.1), 'unit': 'mg/dL'},
+        'TSH': {'range': (0.4, 4.0), 'unit': 'μIU/mL'},
+        'ALT': {'range': (7, 56), 'unit': 'U/L'},
+        'AST': {'range': (10, 40), 'unit': 'U/L'},
+    }
+    CRITICAL_VALUES = {
+        'Hemoglobin': (7, 20),
+        'WBC': (2, 30),
+        'Platelets': (20, 1000),
+        'Glucose_Fasting': (40, 400),
+    }
 
 # Configure poppler path
 if os.path.exists("/usr/bin/pdftoppm"):
@@ -162,7 +176,6 @@ class MedLabRAG:
         self.initialized = False
         
         if not RAG_AVAILABLE or HuggingFaceEmbeddings is None:
-            st.warning("RAG dependencies not available. Running in basic mode.")
             return
             
         self._initialize_system()
@@ -180,87 +193,56 @@ class MedLabRAG:
                     self.vectorstore = FAISS.load_local("medical_vectorstore", self.embeddings)
                     self.initialized = True
                 except Exception as e:
-                    st.info("Creating new medical knowledge base...")
                     self._create_knowledge_base()
             else:
                 self._create_knowledge_base()
-                
         except Exception as e:
-            st.error(f"RAG initialization failed: {e}")
+            st.error(f"RAG init failed: {e}")
     
     def _create_knowledge_base(self):
         """Create medical knowledge base"""
-        medical_texts = self._load_medical_knowledge()
+        texts = [
+            "Iron Deficiency Anemia: Low MCV, high RDW, low ferritin. Next: Iron studies.",
+            "Vitamin B12 Deficiency: Macrocytic anemia, high MCV. Next: B12 level.",
+            "Diabetes: HbA1c >=6.5%, fasting glucose >=126. Next: Lifestyle, metformin.",
+            "Hypothyroidism: Elevated TSH, low FT4. Next: Levothyroxine.",
+            "Acute Kidney Injury: Creatinine rise >0.3 in 48h. Next: Urinalysis, ultrasound.",
+        ]
         
-        if not medical_texts or RecursiveCharacterTextSplitter is None or Document is None:
+        if RecursiveCharacterTextSplitter is None or Document is None:
             return
             
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len
-        )
-        
-        documents = [Document(page_content=text, metadata={"source": "medical_knowledge"}) 
-                    for text in medical_texts]
-        
-        chunks = text_splitter.split_documents(documents)
+        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        docs = [Document(page_content=t) for t in texts]
+        chunks = splitter.split_documents(docs)
         
         if chunks and self.embeddings:
             self.vectorstore = FAISS.from_documents(chunks, self.embeddings)
-            try:
-                self.vectorstore.save_local("medical_vectorstore")
-                self.initialized = True
-            except Exception as e:
-                st.error(f"Could not save vectorstore: {e}")
-    
-    def _load_medical_knowledge(self) -> List[str]:
-        """Load medical knowledge base"""
-        return [
-            "Iron Deficiency Anemia: Low MCV (<80 fL), high RDW, low ferritin. Next: Iron studies, blood loss evaluation.",
-            "Vitamin B12 Deficiency: Macrocytic anemia (MCV >100), hypersegmented neutrophils. Next: B12 level, intrinsic factor.",
-            "Acute Leukemia: Blasts >20% in blood, pancytopenia. Next: Urgent hematology, bone marrow biopsy.",
-            "Diabetes Mellitus: HbA1c ≥6.5%, fasting glucose ≥126. Next: Ophthalmology, microalbumin, statin.",
-            "Hashimoto's Thyroiditis: Elevated TSH, positive anti-TPO. Next: Levothyroxine, annual TSH monitoring.",
-            "Rheumatoid Arthritis: Symmetric polyarthritis, positive RF/anti-CCP. Next: Methotrexate, DMARDs.",
-            "Acute Kidney Injury: Creatinine rise >0.3 in 48h. Next: Urinalysis, renal ultrasound, stop nephrotoxins.",
-            "NAFLD: Elevated ALT/AST, metabolic syndrome. Next: Weight loss, glucose control, hepatitis screen.",
-            "Multiple Myeloma: CRAB features, monoclonal spike. Next: SPEP, free light chains, skeletal survey.",
-        ]
+            self.vectorstore.save_local("medical_vectorstore")
+            self.initialized = True
     
     def enhance_analysis(self, categorized_tests: Dict, rule_based_analysis: Dict) -> str:
-        """Enhance analysis with RAG"""
+        """Enhance with RAG"""
         if not self.initialized or not self.vectorstore:
-            return "RAG system not available."
+            return "RAG not available."
         
         try:
             query_parts = []
-            for category, tests in categorized_tests.items():
+            for cat, tests in categorized_tests.items():
                 for test, value in tests.items():
                     if isinstance(value, (int, float)):
                         ref = REFERENCE_RANGES.get(test, {})
-                        if 'range' in ref:
-                            low, high = ref['range']
-                        else:
-                            low, high = ref.get('male', (0, 0))
-                        
+                        rng = ref.get('range', ref.get('male', (0, 100)))
+                        low, high = rng if isinstance(rng, tuple) else (0, 100)
                         if value < low or value > high:
                             query_parts.append(f"{test} {value}")
             
             if not query_parts:
                 return "All parameters normal."
             
-            query = "Laboratory abnormalities: " + ", ".join(query_parts[:5])
-            docs = self.vectorstore.similarity_search(query, k=3)
-            context = "\n".join([d.page_content for d in docs])
-            
-            return f"""
-            **RAG-Enhanced Insights:**
-            
-            {context}
-            
-            *Retrieved from medical knowledge base*
-            """
+            query = "Abnormalities: " + ", ".join(query_parts[:3])
+            docs = self.vectorstore.similarity_search(query, k=2)
+            return "RAG Insights:\n" + "\n".join([d.page_content for d in docs])
         except Exception as e:
             return f"RAG error: {str(e)}"
     
@@ -280,7 +262,7 @@ def extract_text_from_document(uploaded_file):
     text = ""
     try:
         if uploaded_file.type == "application/pdf":
-            poppler_paths = [None, "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+            poppler_paths = [None, "/usr/bin", "/usr/local/bin"]
             images = None
             
             for poppler_path in poppler_paths:
@@ -313,7 +295,6 @@ def parse_date_from_text(text: str) -> str:
         r'(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})',
         r'(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{2,4})',
         r'Date[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
-        r'Report Date[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
     ]
     
     for pattern in patterns:
@@ -322,20 +303,16 @@ def parse_date_from_text(text: str) -> str:
             try:
                 match = matches[0]
                 if isinstance(match, tuple) and len(match) >= 3:
-                    day, month, year = match[0], match[1], match[2]
-                    if len(year) == 2:
-                        year = '20' + year
-                    try:
-                        if isinstance(month, str) and month.isalpha():
-                            date_obj = datetime.strptime(f"{day} {month} {year}", "%d %b %Y")
-                        else:
-                            date_obj = datetime(int(year), int(month), int(day))
-                        return date_obj.strftime('%Y-%m-%d')
-                    except:
-                        pass
+                    d, m, y = match[0], match[1], match[2]
+                    if len(y) == 2:
+                        y = '20' + y
+                    if isinstance(m, str) and m.isalpha():
+                        dt = datetime.strptime(f"{d} {m} {y}", "%d %b %Y")
+                    else:
+                        dt = datetime(int(y), int(m), int(d))
+                    return dt.strftime('%Y-%m-%d')
             except:
                 continue
-    
     return datetime.now().strftime('%Y-%m-%d')
 
 def parse_lab_values(text: str) -> Dict:
@@ -343,52 +320,36 @@ def parse_lab_values(text: str) -> Dict:
     parsed_data = {}
     
     patterns = {
-        'RBC': r'(?:RBC)[\s:]*(\d+\.?\d*)',
         'Hemoglobin': r'(?:Hemoglobin|Hb)[\s:]*(\d+\.?\d*)',
+        'RBC': r'(?:RBC)[\s:]*(\d+\.?\d*)',
         'Hematocrit': r'(?:Hematocrit|Hct)[\s:]*(\d+\.?\d*)',
         'MCV': r'(?:MCV)[\s:]*(\d+\.?\d*)',
-        'MCH': r'(?:MCH)[\s:]*(\d+\.?\d*)',
-        'MCHC': r'(?:MCHC)[\s:]*(\d+\.?\d*)',
-        'RDW': r'(?:RDW)[\s:]*(\d+\.?\d*)',
         'WBC': r'(?:WBC)[\s:]*(\d+\.?\d*)',
         'Platelets': r'(?:Platelets|PLT)[\s:]*(\d+)',
         'MPV': r'(?:MPV)[\s:]*(\d+\.?\d*)',
-        'Neutrophils': r'(?:Neutrophils|NEUT)[\s:]*(\d+\.?\d*)',
-        'Lymphocytes': r'(?:Lymphocytes|LYMPH)[\s:]*(\d+\.?\d*)',
-        'Monocytes': r'(?:Monocytes|MONO)[\s:]*(\d+\.?\d*)',
-        'Eosinophils': r'(?:Eosinophils|EO)[\s:]*(\d+\.?\d*)',
-        'Basophils': r'(?:Basophils|BASO)[\s:]*(\d+\.?\d*)',
-        'Blasts': r'(?:Blasts)[\s:]*(\d+\.?\d*)',
-        'ALT': r'(?:ALT|SGPT)[\s:]*(\d+\.?\d*)',
-        'AST': r'(?:AST|SGOT)[\s:]*(\d+\.?\d*)',
-        'ALP': r'(?:ALP)[\s:]*(\d+\.?\d*)',
-        'GGT': r'(?:GGT)[\s:]*(\d+\.?\d*)',
-        'Total_Bilirubin': r'(?:Total Bilirubin)[\s:]*(\d+\.?\d*)',
-        'Direct_Bilirubin': r'(?:Direct Bilirubin)[\s:]*(\d+\.?\d*)',
-        'Albumin': r'(?:Albumin)[\s:]*(\d+\.?\d*)',
-        'Total_Protein': r'(?:Total Protein)[\s:]*(\d+\.?\d*)',
+        'Glucose_Fasting': r'(?:Fasting Glucose|FBS)[\s:]*(\d+\.?\d*)',
+        'HbA1c': r'(?:HbA1c|A1c)[\s:]*(\d+\.?\d*)',
         'Creatinine': r'(?:Creatinine)[\s:]*(\d+\.?\d*)',
         'BUN': r'(?:BUN)[\s:]*(\d+\.?\d*)',
         'eGFR': r'(?:eGFR)[\s:]*(\d+\.?\d*)',
         'Sodium': r'(?:Sodium|Na)[\s:]*(\d+\.?\d*)',
         'Potassium': r'(?:Potassium|K)[\s:]*(\d+\.?\d*)',
-        'Calcium': r'(?:Calcium)[\s:]*(\d+\.?\d*)',
-        'Glucose_Fasting': r'(?:Fasting Glucose|FBS)[\s:]*(\d+\.?\d*)',
-        'HbA1c': r'(?:HbA1c|A1c)[\s:]*(\d+\.?\d*)',
         'TSH': r'(?:TSH)[\s:]*(\d+\.?\d*)',
         'Free_T4': r'(?:Free T4|FT4)[\s:]*(\d+\.?\d*)',
+        'ALT': r'(?:ALT|SGPT)[\s:]*(\d+\.?\d*)',
+        'AST': r'(?:AST|SGOT)[\s:]*(\d+\.?\d*)',
+        'ALP': r'(?:ALP)[\s:]*(\d+\.?\d*)',
+        'Total_Bilirubin': r'(?:Total Bilirubin)[\s:]*(\d+\.?\d*)',
+        'Albumin': r'(?:Albumin)[\s:]*(\d+\.?\d*)',
         'Total_Cholesterol': r'(?:Total Cholesterol)[\s:]*(\d+\.?\d*)',
         'HDL': r'(?:HDL)[\s:]*(\d+\.?\d*)',
         'LDL': r'(?:LDL)[\s:]*(\d+\.?\d*)',
         'Triglycerides': r'(?:Triglycerides|TG)[\s:]*(\d+\.?\d*)',
         'CRP': r'(?:CRP)[\s:]*(\d+\.?\d*)',
         'ESR': r'(?:ESR)[\s:]*(\d+\.?\d*)',
-        'RF': r'(?:RF)[\s:]*(\d+\.?\d*)',
-        'Anti_CCP': r'(?:Anti-CCP)[\s:]*(\d+\.?\d*)',
         'Vitamin_D': r'(?:Vitamin D|25-OH)[\s:]*(\d+\.?\d*)',
         'Vitamin_B12': r'(?:Vitamin B12)[\s:]*(\d+\.?\d*)',
         'Ferritin': r'(?:Ferritin)[\s:]*(\d+\.?\d*)',
-        'Iron': r'(?:Iron|Serum Iron)[\s:]*(\d+\.?\d*)',
     }
     
     for param, pattern in patterns.items():
@@ -416,7 +377,7 @@ def get_status_class(test: str, value: float, gender: str = 'male'):
     if 'male' in ref and 'female' in ref:
         low, high = ref[gender]
     else:
-        low, high = ref['range']
+        low, high = ref.get('range', (0, 100))
     
     if value < low:
         return "abnormal-low", "↓", f"Low ({low}-{high})"
@@ -473,6 +434,9 @@ def create_comparative_dataframe(reports: Dict) -> pd.DataFrame:
 
 def initialize_claude():
     """Initialize Claude"""
+    if not ANTHROPIC_AVAILABLE:
+        return None
+        
     try:
         api_key = st.secrets.get("ANTHROPIC_API_KEY", os.getenv("ANTHROPIC_API_KEY"))
         if api_key:
@@ -488,9 +452,8 @@ def get_claude_comparative_analysis(reports: Dict, gender: str, age: int) -> str
         return "Claude not configured. Add ANTHROPIC_API_KEY to secrets."
     
     dates = sorted(reports.keys())
-    summary = f"Patient: {gender}, {age} years\nDates: {', '.join(dates)}\n\nKey Changes:\n"
+    summary = f"Patient: {gender}, {age} years\nDates: {', '.join(dates)}\n\nChanges:\n"
     
-    # Find significant changes
     all_tests = set()
     for report in reports.values():
         all_tests.update(report.keys())
@@ -511,12 +474,7 @@ def get_claude_comparative_analysis(reports: Dict, gender: str, age: int) -> str
 
 {summary}
 
-Provide:
-1. Clinical significance of changes
-2. Possible diagnoses
-3. Red flags
-4. Next steps
-5. Overall trajectory"""
+Provide: 1) Clinical significance 2) Possible diagnoses 3) Red flags 4) Next steps 5) Overall trajectory"""
 
     try:
         response = client.messages.create(
@@ -532,6 +490,10 @@ Provide:
 def generate_pdf_report(reports: Dict, comparative_df: pd.DataFrame, claude_analysis: str, 
                        rag_analysis: str, gender: str, age: int) -> BytesIO:
     """Generate PDF report"""
+    if not REPORTLAB_AVAILABLE:
+        st.error("PDF generation not available. Install reportlab.")
+        return BytesIO()
+        
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=0.5*inch, bottomMargin=0.5*inch)
     elements = []
@@ -542,20 +504,16 @@ def generate_pdf_report(reports: Dict, comparative_df: pd.DataFrame, claude_anal
     heading_style = ParagraphStyle('Heading', parent=styles['Heading2'], fontSize=14,
                                   textColor=colors.HexColor('#1e40af'), spaceAfter=12, spaceBefore=12)
     
-    # Title
-    elements.append(Paragraph("MedLab AI - Comprehensive Laboratory Report", title_style))
+    elements.append(Paragraph("MedLab AI - Laboratory Report", title_style))
     elements.append(Paragraph(f"<b>Patient:</b> {gender}, {age} years", styles['Normal']))
     elements.append(Paragraph(f"<b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles['Normal']))
     elements.append(Spacer(1, 0.3*inch))
     
-    # Summary
-    elements.append(Paragraph("Executive Summary", heading_style))
+    elements.append(Paragraph("Summary", heading_style))
     elements.append(Paragraph(f"• Reports: {len(reports)}", styles['Normal']))
     elements.append(Paragraph(f"• Date Range: {min(reports.keys())} to {max(reports.keys())}", styles['Normal']))
-    elements.append(Paragraph(f"• Parameters: {len(set().union(*[set(r.keys()) for r in reports.values()]))}", styles['Normal']))
     elements.append(Spacer(1, 0.2*inch))
     
-    # Comparative Table
     elements.append(Paragraph("Comparative Results", heading_style))
     table_data = [['Parameter'] + sorted(reports.keys()) + ['Trend']]
     
@@ -578,7 +536,6 @@ def generate_pdf_report(reports: Dict, comparative_df: pd.DataFrame, claude_anal
     elements.append(table)
     elements.append(Spacer(1, 0.3*inch))
     
-    # AI Analysis
     if claude_analysis:
         elements.append(PageBreak())
         elements.append(Paragraph("Claude AI Analysis", heading_style))
@@ -587,12 +544,10 @@ def generate_pdf_report(reports: Dict, comparative_df: pd.DataFrame, claude_anal
                 elements.append(Paragraph(para.replace('\n', '<br/>'), styles['Normal']))
                 elements.append(Spacer(1, 0.1*inch))
     
-    # RAG Analysis
     if rag_analysis and "not available" not in rag_analysis:
-        elements.append(Paragraph("RAG-Enhanced Insights", heading_style))
+        elements.append(Paragraph("RAG Insights", heading_style))
         elements.append(Paragraph(rag_analysis.replace('\n', '<br/>'), styles['Normal']))
     
-    # Disclaimer
     elements.append(Spacer(1, 0.3*inch))
     elements.append(Paragraph(
         "<b>Disclaimer:</b> AI-generated for educational purposes. Verify with healthcare professionals.",
@@ -606,17 +561,14 @@ def generate_pdf_report(reports: Dict, comparative_df: pd.DataFrame, claude_anal
 def categorize_tests(tests: Dict) -> Dict[str, Dict]:
     """Categorize tests"""
     categories = {
-        'Hematology': ['RBC', 'Hemoglobin', 'Hematocrit', 'MCV', 'MCH', 'MCHC', 'RDW', 
-                      'WBC', 'Platelets', 'MPV', 'Neutrophils', 'Lymphocytes', 'Monocytes',
-                      'Eosinophils', 'Basophils', 'Blasts'],
-        'Liver_Function': ['ALT', 'AST', 'ALP', 'GGT', 'Total_Bilirubin', 'Direct_Bilirubin',
-                          'Albumin', 'Total_Protein'],
-        'Kidney_Function': ['Creatinine', 'BUN', 'eGFR', 'Sodium', 'Potassium', 'Calcium'],
-        'Metabolic': ['Glucose_Fasting', 'HbA1c', 'Insulin'],
+        'Hematology': ['RBC', 'Hemoglobin', 'Hematocrit', 'MCV', 'WBC', 'Platelets', 'MPV'],
+        'Liver_Function': ['ALT', 'AST', 'ALP', 'Total_Bilirubin', 'Albumin'],
+        'Kidney_Function': ['Creatinine', 'BUN', 'eGFR', 'Sodium', 'Potassium'],
+        'Metabolic': ['Glucose_Fasting', 'HbA1c'],
         'Endocrine': ['TSH', 'Free_T4'],
         'Lipid_Profile': ['Total_Cholesterol', 'HDL', 'LDL', 'Triglycerides'],
-        'Immunology': ['CRP', 'ESR', 'RF', 'Anti_CCP'],
-        'Vitamins': ['Vitamin_D', 'Vitamin_B12', 'Ferritin', 'Iron']
+        'Immunology': ['CRP', 'ESR'],
+        'Vitamins': ['Vitamin_D', 'Vitamin_B12', 'Ferritin']
     }
     
     result = {cat: {} for cat in categories.keys()}
@@ -638,11 +590,10 @@ def display_date_wise_reports(reports: Dict, gender: str, rag_system: MedLabRAG)
         
         # RAG insight for this report
         if rag_system and rag_system.initialized:
-            with st.expander("🧠 RAG Insight for this report"):
+            with st.expander("🧠 RAG Insight"):
                 rag_insight = rag_system.enhance_analysis(categorized, {})
                 st.markdown(f'<div class="rag-insight">{rag_insight}</div>', unsafe_allow_html=True)
         
-        # Display by category
         for cat_name, cat_tests in categorized.items():
             if cat_tests:
                 with st.expander(f"{cat_name.replace('_', ' ')} ({len(cat_tests)} parameters)"):
@@ -666,20 +617,24 @@ def display_date_wise_reports(reports: Dict, gender: str, rag_system: MedLabRAG)
 # ==================== MAIN APPLICATION ====================
 def main():
     st.markdown('<h1 class="main-header">🧬 MedLab AI Analyzer</h1>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">RAG-Enhanced Multi-Report Comparative Analysis</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">Multi-Report Comparative Analysis with AI</p>', unsafe_allow_html=True)
     
     # Initialize systems
     if st.session_state.claude_client is None:
         st.session_state.claude_client = initialize_claude()
     
     if st.session_state.rag_system is None and RAG_AVAILABLE:
-        with st.spinner("Initializing RAG system..."):
+        with st.spinner("Initializing RAG..."):
             st.session_state.rag_system = MedLabRAG()
     
     # Status badges
-    rag_status = "rag-active" if (st.session_state.rag_system and st.session_state.rag_system.initialized) else "rag-inactive"
-    rag_text = "🧠 RAG Active" if (st.session_state.rag_system and st.session_state.rag_system.initialized) else "🧠 RAG Offline"
-    st.markdown(f'<div class="status-badge {rag_status}">{rag_text}</div>', unsafe_allow_html=True)
+    rag_active = st.session_state.rag_system and st.session_state.rag_system.initialized
+    rag_class = "rag-active" if rag_active else "rag-inactive"
+    rag_text = "🧠 RAG Active" if rag_active else "🧠 RAG Offline"
+    st.markdown(f'<div class="status-badge {rag_class}">{rag_text}</div>', unsafe_allow_html=True)
+    
+    if not ANTHROPIC_AVAILABLE or not st.session_state.claude_client:
+        st.markdown('<div class="status-badge feature-off" style="bottom: 60px;">🤖 Claude Offline</div>', unsafe_allow_html=True)
     
     # Sidebar
     with st.sidebar:
@@ -703,7 +658,6 @@ def main():
                         report_date = parse_date_from_text(text)
                         values = parse_lab_values(text)
                         
-                        # Handle duplicate dates
                         base_date = report_date
                         counter = 1
                         while report_date in st.session_state.parsed_reports:
@@ -776,9 +730,11 @@ def main():
                         
                         if selected_param in REFERENCE_RANGES:
                             ref = REFERENCE_RANGES[selected_param]
-                            low, high = ref.get('range', ref.get(gender.lower(), (0, 0)))
-                            fig.add_hline(y=low, line_dash="dash", line_color="green")
-                            fig.add_hline(y=high, line_dash="dash", line_color="green")
+                            rng = ref.get('range', ref.get(gender.lower(), (0, 0)))
+                            if isinstance(rng, tuple):
+                                low, high = rng
+                                fig.add_hline(y=low, line_dash="dash", line_color="green")
+                                fig.add_hline(y=high, line_dash="dash", line_color="green")
                         
                         fig.update_layout(title=f"{selected_param} Trend", xaxis_title="Date", yaxis_title="Value")
                         st.plotly_chart(fig, use_container_width=True)
@@ -803,11 +759,12 @@ def main():
                     if 'claude_analysis' in st.session_state:
                         st.markdown(f'<div class="claude-analysis">{st.session_state.claude_analysis}</div>', 
                                   unsafe_allow_html=True)
+                else:
+                    st.info("Need 2+ reports for Claude analysis")
             
             with col2:
                 st.markdown("### RAG-Enhanced Insights")
                 if st.session_state.rag_system and st.session_state.rag_system.initialized:
-                    # Aggregate all abnormalities for RAG
                     all_categorized = {}
                     for date, report in st.session_state.parsed_reports.items():
                         cat = categorize_tests(report)
@@ -819,7 +776,7 @@ def main():
                     rag_insight = st.session_state.rag_system.enhance_analysis(all_categorized, {})
                     st.markdown(f'<div class="rag-insight">{rag_insight}</div>', unsafe_allow_html=True)
                 else:
-                    st.info("RAG system not available")
+                    st.info("RAG not available")
         
         with tabs[3]:
             st.subheader("Generate Final Report")
@@ -843,7 +800,7 @@ def main():
                                     if c not in all_cat:
                                         all_cat[c] = {}
                                     all_cat[c].update(t)
-                            rag_text = st.session_state.rag_system.enhance_analysis(all_cat, {})
+                            rag_text = st.session_state.rag_system.enhance_analysis(all_cat, '')
                         
                         pdf_buffer = generate_pdf_report(
                             st.session_state.parsed_reports,
@@ -854,12 +811,15 @@ def main():
                             age
                         )
                         
-                        st.download_button(
-                            label="⬇️ Download PDF",
-                            data=pdf_buffer,
-                            file_name=f"{report_title.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.pdf",
-                            mime="application/pdf"
-                        )
+                        if pdf_buffer.getvalue():
+                            st.download_button(
+                                label="⬇️ Download PDF",
+                                data=pdf_buffer,
+                                file_name=f"{report_title.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                                mime="application/pdf"
+                            )
+            else:
+                st.info("No reports to generate")
     else:
         st.info("👆 Upload lab reports to begin analysis")
 
