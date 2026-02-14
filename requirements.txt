@@ -1,33 +1,29 @@
-
-
-# requirements.txt - FINAL UPDATED VERSION
+# requirements.txt - SIMPLIFIED STABLE VERSION
 # Core application
-streamlit
-pandas
-numpy
-python-dotenv
+streamlit==1.28.0
+pandas==2.0.3
+numpy==1.24.3
+Pillow==10.0.0
+python-dotenv==1.0.0
 
 # Document processing
-Pillow
-pytesseract
-pdf2image
-opencv-python-headless
+pytesseract==0.3.10
+pdf2image==1.16.3
+opencv-python-headless==4.8.0.76
 
 # Visualization
-plotly
+plotly==5.18.0
 
 # AI/ML - Claude
-anthropic
-
-# AI/ML - RAG (LangChain)
-langchain
-langchain-community
-langchain-text-splitters
-sentence-transformers
-faiss-cpu
+anthropic==0.8.0
 
 # PDF generation
-reportlab
+reportlab==4.0.7
 
-# Utilities
-pypdf
+# RAG - Simplified (only if needed)
+# Comment out if causing issues, app works without RAG
+# langchain==0.1.0
+# langchain-community==0.0.13
+# langchain-text-splitters==0.0.1
+# sentence-transformers==2.2.2
+# faiss-cpu==1.7.4
